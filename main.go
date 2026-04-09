@@ -8,6 +8,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"time"
 
@@ -23,6 +24,7 @@ var UserStates sync.Map
 var UserRequestCount sync.Map
 var UserMode sync.Map
 var UserTextHistory sync.Map
+var UserSelectedModel sync.Map
 var aiClient openai.Client
 var ollamaClient openai.Client
 
@@ -63,6 +65,8 @@ func main() {
 	b.RegisterHandler(bot.HandlerTypeMessageText, "/clear_requests", bot.MatchTypeExact, clearRequestsHandler)
 	b.RegisterHandler(bot.HandlerTypeMessageText, "/text", bot.MatchTypeExact, textModeHandler)
 	b.RegisterHandler(bot.HandlerTypeMessageText, "/image", bot.MatchTypeExact, imageModeHandler)
+	b.RegisterHandler(bot.HandlerTypeMessageText, "/model", bot.MatchTypeExact, modelChoicesHandler)
+	b.RegisterHandler(bot.HandlerTypeCallbackQueryData, "model:", bot.MatchTypePrefix, modelsSelectHandler)
 
 	user, _ := b.GetMe(ctx)
 	fmt.Printf("Bot name: %#v\n", user.Username)
@@ -71,6 +75,7 @@ func main() {
 		Commands: []models.BotCommand{
 			{Command: "start", Description: "Запуск бота"},
 			{Command: "text", Description: "Текстовый режим"},
+			{Command: "model", Description: "Выбрать модель"},
 			{Command: "image", Description: "Режим генерации изображений"},
 			{Command: "clear", Description: "Очистить историю"},
 		},
@@ -243,6 +248,11 @@ func imageModeHandler(ctx context.Context, b *bot.Bot, update *models.Update) {
 }
 
 func handleText(ctx context.Context, b *bot.Bot, update *models.Update, userID int64, question string) {
+	modelName := "gemma3n:e2b"
+	if m, ok := UserSelectedModel.Load(userID); ok {
+		modelName = m.(string)
+	}
+
 	var history []openai.ChatCompletionMessageParamUnion
 	if h, ok := UserTextHistory.Load(userID); ok {
 		history = h.([]openai.ChatCompletionMessageParamUnion)
@@ -269,7 +279,7 @@ func handleText(ctx context.Context, b *bot.Bot, update *models.Update, userID i
 	}
 
 	response, err := ollamaClient.Chat.Completions.New(ctx, openai.ChatCompletionNewParams{
-		Model: openai.ChatModel("qwen3.5:9b"),
+		Model: openai.ChatModel(modelName),
 		Messages: append([]openai.ChatCompletionMessageParamUnion{
 			openai.SystemMessage(""),
 			openai.UserMessage(question),
@@ -353,4 +363,66 @@ func handleImage(ctx context.Context, b *bot.Bot, update *models.Update, userID 
 		return
 	}
 	UserRequestCount.Store(userID, count+1)
+}
+
+func modelChoicesHandler(ctx context.Context, b *bot.Bot, update *models.Update) {
+	kb := &models.InlineKeyboardMarkup{
+		InlineKeyboard: [][]models.InlineKeyboardButton{
+			{
+				{
+					Text: "gemma3:1b (Самая быстрая)", CallbackData: "model:gemma3n:e2b",
+				},
+			},
+			{
+				{
+					Text: "qwen3:4b (Средняя)", CallbackData: "model:qwen3.5:4b",
+				},
+			},
+			{
+				{
+					Text: "qwen3.5:9b (Самая умная и качественная)", CallbackData: "model:gemma3:4b",
+				},
+			},
+			{
+				{
+					Text: "rnj-1 (Для математических задач)", CallbackData: "model:rnj-1",
+				},
+			},
+		},
+	}
+	_, err := b.SendMessage(ctx, &bot.SendMessageParams{
+		ChatID:      update.Message.Chat.ID,
+		Text:        "Выбери модель:",
+		ReplyMarkup: kb,
+	})
+	if err != nil {
+		log.Println(err)
+		return
+	}
+}
+
+func modelsSelectHandler(ctx context.Context, b *bot.Bot, update *models.Update) {
+	userID := update.CallbackQuery.From.ID
+
+	modelName := strings.TrimPrefix(update.CallbackQuery.Data, "model:")
+	UserSelectedModel.Store(userID, modelName)
+
+	_, err := b.AnswerCallbackQuery(ctx, &bot.AnswerCallbackQueryParams{
+		CallbackQueryID: update.CallbackQuery.ID,
+		Text:            "Модель выбрана: " + modelName,
+	})
+	if err != nil {
+		log.Println(err)
+		return
+	}
+
+	_, err = b.EditMessageText(ctx, &bot.EditMessageTextParams{
+		ChatID:    update.CallbackQuery.Message.Message.Chat.ID,
+		MessageID: update.CallbackQuery.Message.Message.ID,
+		Text:      "Выбрана модель: " + modelName,
+	})
+	if err != nil {
+		log.Println(err)
+		return
+	}
 }
