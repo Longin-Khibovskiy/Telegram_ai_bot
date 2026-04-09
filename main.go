@@ -68,6 +68,18 @@ func main() {
 	user, _ := b.GetMe(ctx)
 	fmt.Printf("Bot name: %#v\n", user.Username)
 
+	_, err = b.SetMyCommands(ctx, &bot.SetMyCommandsParams{
+		Commands: []models.BotCommand{
+			{Command: "start", Description: "Запуск бота"},
+			{Command: "text", Description: "Текстовый режим"},
+			{Command: "image", Description: "Режим генерации изображений"},
+			{Command: "clear", Description: "Очистить историю"},
+		},
+	})
+	if err != nil {
+		log.Println("SetMyCommands", err)
+	}
+
 	b.Start(ctx)
 }
 
