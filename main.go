@@ -20,7 +20,6 @@ import (
 
 var SeenUsers sync.Map
 var UserStates sync.Map
-var UserLastResponseID sync.Map
 var UserRequestCount sync.Map
 var UserMode sync.Map
 var UserTextHistory sync.Map
@@ -213,6 +212,7 @@ func textModeHandler(ctx context.Context, b *bot.Bot, update *models.Update) {
 			Text:   "Произошла ошибка, попробуйте чуть позже🙏",
 		})
 		if err != nil {
+			log.Println(err)
 			return
 		}
 		return
@@ -234,6 +234,7 @@ func imageModeHandler(ctx context.Context, b *bot.Bot, update *models.Update) {
 			Text:   "Произошла ошибка, попробуйте чуть позже🙏",
 		})
 		if err != nil {
+			log.Println(err)
 			return
 		}
 		return
@@ -249,8 +250,26 @@ func handleText(ctx context.Context, b *bot.Bot, update *models.Update, userID i
 
 	history = append(history, openai.UserMessage(question))
 
+	message, err := b.SendMessage(ctx, &bot.SendMessageParams{
+		ChatID: update.Message.Chat.ID,
+		Text:   "Думает...",
+	})
+	if err != nil {
+		log.Println(err)
+		return
+	}
+
+	_, err = b.SendChatAction(ctx, &bot.SendChatActionParams{
+		ChatID: update.Message.Chat.ID,
+		Action: models.ChatActionTyping,
+	})
+	if err != nil {
+		log.Println(err)
+		return
+	}
+
 	response, err := ollamaClient.Chat.Completions.New(ctx, openai.ChatCompletionNewParams{
-		Model: openai.ChatModel("qwen3:8b"),
+		Model: openai.ChatModel("qwen3.5:9b"),
 		Messages: append([]openai.ChatCompletionMessageParamUnion{
 			openai.SystemMessage(""),
 			openai.UserMessage(question),
@@ -263,8 +282,18 @@ func handleText(ctx context.Context, b *bot.Bot, update *models.Update, userID i
 			Text:   "❌ Ошибка, попробуйте еще разочек",
 		})
 		if err != nil {
+			log.Println(err)
 			return
 		}
+		return
+	}
+
+	_, err = b.DeleteMessage(ctx, &bot.DeleteMessageParams{
+		ChatID:    update.Message.Chat.ID,
+		MessageID: message.ID,
+	})
+	if err != nil {
+		log.Println(err)
 		return
 	}
 
