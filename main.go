@@ -57,7 +57,7 @@ func main() {
 
 	ollamaClient = openai.NewClient(
 		option.WithAPIKey("ollama"),
-		option.WithBaseURL("http://localhost:11434/v1/"),
+		option.WithBaseURL("http://ollama:11434/v1/"),
 	)
 
 	b.RegisterHandler(bot.HandlerTypeMessageText, "/start", bot.MatchTypeExact, startHandler)
@@ -279,9 +279,10 @@ func handleText(ctx context.Context, b *bot.Bot, update *models.Update, userID i
 	}
 
 	response, err := ollamaClient.Chat.Completions.New(ctx, openai.ChatCompletionNewParams{
-		Model: openai.ChatModel(modelName),
+		Model:     openai.ChatModel(modelName),
+		MaxTokens: openai.Int(256),
 		Messages: append([]openai.ChatCompletionMessageParamUnion{
-			openai.SystemMessage(""),
+			openai.SystemMessage("Отвечай максимум 150 символами. В ответе должна быть вся необходимая информация. Не пиши про символы"),
 			openai.UserMessage(question),
 		}, history...),
 	})
