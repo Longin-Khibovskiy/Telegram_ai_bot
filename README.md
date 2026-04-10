@@ -5,6 +5,7 @@
 
 docker compose --profile local build
 docker compose --profile local up
+docker exec -it ollama ollama pull gemma3:1b
 docker exec -it ollama ollama pull gemma3n:e2b
 docker exec -it ollama ollama pull qwen3.5:4b
 docker exec -it ollama ollama pull gemma3:4b

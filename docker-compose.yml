@@ -27,6 +27,7 @@ services:
     environment:
       - TELEGRAM_API_KEY=${TELEGRAM_API_KEY}
       - OPEN_AI_API_KEY=${OPEN_AI_API_KEY}
+      - DATABASE_URL=postgres://postgres:${PGPASSWORD}@db:5432/postgres
     restart: unless-stopped
     extra_hosts:
       - "host.docker.internal:host-gateway"

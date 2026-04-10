@@ -9,22 +9,17 @@ import (
 	"os"
 	"os/signal"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/go-telegram/bot"
 	"github.com/go-telegram/bot/models"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/joho/godotenv"
 	"github.com/openai/openai-go/v3"
 	"github.com/openai/openai-go/v3/option"
 )
 
-var SeenUsers sync.Map
-var UserStates sync.Map
-var UserRequestCount sync.Map
-var UserMode sync.Map
-var UserTextHistory sync.Map
-var UserSelectedModel sync.Map
+var db *pgxpool.Pool
 var aiClient openai.Client
 var ollamaClient openai.Client
 
@@ -33,12 +28,32 @@ const (
 	StateWaiting = "waiting"
 )
 
+type userRow struct {
+	State         string
+	Mode          string
+	RequestCount  int
+	SelectedModel string
+	Seen          bool
+}
+
 func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer cancel()
 
 	if err := godotenv.Load(); err != nil {
 		log.Fatal("ENV")
+	}
+	var err error
+	db, err = pgxpool.New(ctx, os.Getenv("DATABASE_URL"))
+	if err != nil {
+		log.Fatal(err)
+		return
+	}
+	defer db.Close()
+
+	if err := initDB(ctx); err != nil {
+		log.Fatal("initDB error - ", err)
+		return
 	}
 
 	b, err := bot.New(
@@ -87,22 +102,140 @@ func main() {
 	b.Start(ctx)
 }
 
+func initDB(ctx context.Context) error {
+	_, err := db.Exec(ctx,
+		`CREATE TABLE IF NOT EXISTS users (
+			user_id       BIGINT PRIMARY KEY,
+			state         TEXT NOT NULL DEFAULT 'idle',
+			mode          TEXT NOT NULL DEFAULT 'text',
+			request_count INT  NOT NULL DEFAULT 0,
+			selected_model TEXT NOT NULL DEFAULT 'gemma3:1b',
+			seen          BOOLEAN NOT NULL DEFAULT false,
+			created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+		);
+		CREATE TABLE IF NOT EXISTS message_history (
+			id         SERIAL PRIMARY KEY,
+			user_id    BIGINT NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+			role       TEXT NOT NULL,
+			content    TEXT NOT NULL,
+			created_at TIMESTAMPTZ NOT NULL DEFAULT now());`,
+	)
+	return err
+}
+
+func ensureUser(ctx context.Context, UserID int64) error {
+	_, err := db.Exec(ctx, `INSERT INTO users(user_id) VALUES ($1) ON CONFLICT (user_id) DO NOTHING`, UserID)
+	return err
+}
+
+func getUser(ctx context.Context, UserID int64) (userRow, error) {
+	var u userRow
+	err := db.QueryRow(ctx, `
+		SELECT state, mode, request_count, selected_model, seen
+		FROM users WHERE user_id = $1
+	`, UserID).Scan(&u.State, &u.Mode, &u.RequestCount, &u.SelectedModel, &u.Seen)
+	return u, err
+}
+
+func setUserState(ctx context.Context, UserID int64, state string) error {
+	_, err := db.Exec(ctx, `UPDATE users SET state=$1 WHERE user_id=$2`, state, UserID)
+	return err
+}
+
+func setUserMode(ctx context.Context, UserID int64, mode string) error {
+	_, err := db.Exec(ctx, `UPDATE users SET mode=$1 WHERE user_id=$2`, mode, UserID)
+	return err
+}
+
+func setUserModel(ctx context.Context, UserID int64, model string) error {
+	_, err := db.Exec(ctx, `UPDATE users SET selected_model=$1 WHERE user_id=$2`, model, UserID)
+	return err
+}
+
+func incrementRequestCount(ctx context.Context, UserID int64) error {
+	_, err := db.Exec(ctx, `UPDATE users SET request_count = request_count + 1 WHERE user_id=$1`, UserID)
+	return err
+}
+
+func resetRequestCount(ctx context.Context, UserID int64) error {
+	_, err := db.Exec(ctx, `UPDATE users SET request_count=0 WHERE user_id=$1`, UserID)
+	return err
+}
+
+func markSeen(ctx context.Context, UserID int64) (alreadySeen bool, err error) {
+	var seen bool
+	err = db.QueryRow(ctx, `
+		UPDATE users SET seen=true WHERE user_id=$1 RETURNING (seen AND $2)
+	`, UserID, true).Scan(&seen)
+	// easier: just check before update
+	return seen, err
+}
+
+func appendHistory(ctx context.Context, UserID int64, role, content string) error {
+	_, err := db.Exec(ctx, `
+		INSERT INTO message_history (user_id, role, content) VALUES ($1,$2,$3)
+	`, UserID, role, content)
+	return err
+}
+
+func getHistory(ctx context.Context, UserID int64) ([]openai.ChatCompletionMessageParamUnion, error) {
+	rows, err := db.Query(ctx, `
+		SELECT role, content FROM message_history
+		WHERE user_id=$1 ORDER BY created_at ASC
+	`, UserID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var history []openai.ChatCompletionMessageParamUnion
+	for rows.Next() {
+		var role, content string
+		if err := rows.Scan(&role, &content); err != nil {
+			return nil, err
+		}
+		switch role {
+		case "user":
+			history = append(history, openai.UserMessage(content))
+		case "assistant":
+			history = append(history, openai.AssistantMessage(content))
+		}
+	}
+	return history, nil
+}
+
+func clearHistory(ctx context.Context, UserID int64) error {
+	_, err := db.Exec(ctx, `DELETE FROM message_history WHERE user_id=$1`, UserID)
+	return err
+}
+
 func startHandler(ctx context.Context, b *bot.Bot, update *models.Update) {
-	UserId := update.Message.From.ID
+	UserID := update.Message.From.ID
 	UserName := update.Message.From.Username
 	UserFirstName := update.Message.From.FirstName
 	Premium := update.Message.From.IsPremium
 
-	UserStates.Store(UserId, StateWaiting)
-	UserMode.Store(UserId, "text")
-
-	if _, loaded := SeenUsers.LoadOrStore(UserId, true); !loaded {
-		fmt.Printf("New user:\n id: %d\n Name: @%s\n Premium: %t\n", UserId, UserName, Premium)
-		fmt.Printf("Начало пользования в %s\n", time.Now())
-
+	if err := ensureUser(ctx, UserID); err != nil {
+		log.Println("ensureUser:", err)
+		return
 	}
 
-	_, err := b.SendMessage(ctx, &bot.SendMessageParams{
+	user, err := getUser(ctx, UserID)
+	if err != nil {
+		log.Println("getUser:", err)
+		return
+	}
+
+	if !user.Seen {
+		fmt.Printf("New user:\n id: %d\n Name: @%s\n Premium: %t\n", UserID, UserName, Premium)
+		fmt.Printf("Начало пользования в %s\n", time.Now())
+		db.Exec(ctx, `UPDATE users SET seen=true WHERE user_id=$1`, UserID)
+	}
+
+	setUserState(ctx, UserID, StateWaiting)
+	setUserMode(ctx, UserID, "text")
+
+	_, err = b.SendMessage(ctx, &bot.SendMessageParams{
 		ChatID: update.Message.Chat.ID,
 		Text:   fmt.Sprintf("Привет, %s! 👋\nДобро пожаловать!\nПо умолчанию стоит режим генерации текста, чтобы переключиться на режим генерации изображений напиши /image, а чтобы вернуться, напишите /text\nЧтобы сбросить историю в текстовом генераторе напишите /clear_requests", UserFirstName),
 	})
@@ -125,10 +258,20 @@ func handler(ctx context.Context, b *bot.Bot, update *models.Update) {
 	if update.Message == nil {
 		return
 	}
-	userID := update.Message.From.ID
-	state, _ := UserStates.LoadOrStore(userID, StateIdle)
+	UserID := update.Message.From.ID
 
-	if state != StateWaiting {
+	if err := ensureUser(ctx, UserID); err != nil {
+		log.Println("ensureUser:", err)
+		return
+	}
+
+	user, err := getUser(ctx, UserID)
+	if err != nil {
+		log.Println("getUser:", err)
+		return
+	}
+
+	if user.State != StateWaiting {
 		_, err := b.SendMessage(ctx, &bot.SendMessageParams{
 			ChatID: update.Message.Chat.ID,
 			Text:   "Напиши /start чтобы начать\n/text — текстовый режим\n/image — режим изображений",
@@ -140,11 +283,7 @@ func handler(ctx context.Context, b *bot.Bot, update *models.Update) {
 		return
 	}
 
-	count := 0
-	if v, ok := UserRequestCount.Load(userID); ok {
-		count = v.(int)
-	}
-	if count >= 5 {
+	if user.RequestCount >= 5 {
 		_, err := b.SendMessage(ctx, &bot.SendMessageParams{
 			ChatID: update.Message.Chat.ID,
 			Text:   "❌ Вы исчерпали лимит в 5 запросов.\nНапишите @Longin_khibovskiy для покупки 😂",
@@ -157,27 +296,23 @@ func handler(ctx context.Context, b *bot.Bot, update *models.Update) {
 		return
 	}
 
-	fmt.Println(userID, " - ", count)
-
-	mode := "text"
-	if m, ok := UserMode.Load(userID); ok {
-		mode = m.(string)
-	}
+	fmt.Println(UserID, " - ", user.RequestCount)
 
 	question := update.Message.Text
 
-	switch mode {
+	switch user.Mode {
 	case "text":
-		handleText(ctx, b, update, userID, question)
+		handleText(ctx, b, update, UserID, user.SelectedModel, question)
 	case "image":
-		handleImage(ctx, b, update, userID, count, question)
+		handleImage(ctx, b, update, UserID, user.RequestCount, question)
 	}
 }
 
 func clearHandler(ctx context.Context, b *bot.Bot, update *models.Update) {
-	userID := update.Message.From.ID
-	UserTextHistory.Delete(userID)
-	//UserLastResponseID.Delete(update.Message.From.ID)
+	UserID := update.Message.From.ID
+	if err := clearHistory(ctx, UserID); err != nil {
+		log.Println("clearHistory:", err)
+	}
 
 	_, err := b.SendMessage(ctx, &bot.SendMessageParams{
 		ChatID: update.Message.Chat.ID,
@@ -190,7 +325,9 @@ func clearHandler(ctx context.Context, b *bot.Bot, update *models.Update) {
 }
 
 func clearRequestsHandler(ctx context.Context, b *bot.Bot, update *models.Update) {
-	UserRequestCount.Delete(update.Message.From.ID)
+	if err := resetRequestCount(ctx, update.Message.From.ID); err != nil {
+		log.Println("resetRequestCount:", err)
+	}
 
 	_, err := b.SendMessage(ctx, &bot.SendMessageParams{
 		ChatID: update.Message.Chat.ID,
@@ -203,8 +340,10 @@ func clearRequestsHandler(ctx context.Context, b *bot.Bot, update *models.Update
 }
 
 func textModeHandler(ctx context.Context, b *bot.Bot, update *models.Update) {
-	UserMode.Store(update.Message.From.ID, "text")
-	UserStates.Store(update.Message.From.ID, StateWaiting)
+	UserID := update.Message.From.ID
+	ensureUser(ctx, UserID)
+	setUserMode(ctx, UserID, "text")
+	setUserState(ctx, UserID, StateWaiting)
 
 	_, err := b.SendMessage(ctx, &bot.SendMessageParams{
 		ChatID: update.Message.Chat.ID,
@@ -225,8 +364,10 @@ func textModeHandler(ctx context.Context, b *bot.Bot, update *models.Update) {
 }
 
 func imageModeHandler(ctx context.Context, b *bot.Bot, update *models.Update) {
-	UserMode.Store(update.Message.From.ID, "image")
-	UserStates.Store(update.Message.From.ID, StateWaiting)
+	UserID := update.Message.From.ID
+	ensureUser(ctx, UserID)
+	setUserMode(ctx, UserID, "image")
+	setUserState(ctx, UserID, StateWaiting)
 
 	_, err := b.SendMessage(ctx, &bot.SendMessageParams{
 		ChatID: update.Message.Chat.ID,
@@ -247,17 +388,11 @@ func imageModeHandler(ctx context.Context, b *bot.Bot, update *models.Update) {
 	}
 }
 
-func handleText(ctx context.Context, b *bot.Bot, update *models.Update, userID int64, question string) {
-	modelName := "gemma3n:e2b"
-	if m, ok := UserSelectedModel.Load(userID); ok {
-		modelName = m.(string)
+func handleText(ctx context.Context, b *bot.Bot, update *models.Update, UserID int64, modelName string, question string) {
+	history, err := getHistory(ctx, UserID)
+	if err != nil {
+		log.Println("getHistory:", err)
 	}
-
-	var history []openai.ChatCompletionMessageParamUnion
-	if h, ok := UserTextHistory.Load(userID); ok {
-		history = h.([]openai.ChatCompletionMessageParamUnion)
-	}
-
 	history = append(history, openai.UserMessage(question))
 
 	message, err := b.SendMessage(ctx, &bot.SendMessageParams{
@@ -283,7 +418,6 @@ func handleText(ctx context.Context, b *bot.Bot, update *models.Update, userID i
 		MaxTokens: openai.Int(256),
 		Messages: append([]openai.ChatCompletionMessageParamUnion{
 			openai.SystemMessage("Отвечай максимум 150 символами. В ответе должна быть вся необходимая информация. Не пиши про символы"),
-			openai.UserMessage(question),
 		}, history...),
 	})
 	if err != nil {
@@ -309,8 +443,12 @@ func handleText(ctx context.Context, b *bot.Bot, update *models.Update, userID i
 	}
 
 	answer := response.Choices[0].Message.Content
-	history = append(history, openai.AssistantMessage(answer))
-	UserTextHistory.Store(userID, history)
+	if err := appendHistory(ctx, UserID, "user", question); err != nil {
+		log.Println("appendHistory user:", err)
+	}
+	if err := appendHistory(ctx, UserID, "assistant", answer); err != nil {
+		log.Println("appendHistory assistant:", err)
+	}
 
 	_, err = b.SendMessage(ctx, &bot.SendMessageParams{
 		ChatID: update.Message.Chat.ID,
@@ -323,7 +461,7 @@ func handleText(ctx context.Context, b *bot.Bot, update *models.Update, userID i
 
 }
 
-func handleImage(ctx context.Context, b *bot.Bot, update *models.Update, userID int64, count int, question string) {
+func handleImage(ctx context.Context, b *bot.Bot, update *models.Update, UserID int64, count int, question string) {
 	_, err := b.SendMessage(ctx, &bot.SendMessageParams{
 		ChatID: update.Message.Chat.ID,
 		Text:   "Генерирую изображение...",
@@ -345,10 +483,13 @@ func handleImage(ctx context.Context, b *bot.Bot, update *models.Update, userID 
 	response, err := aiClient.Images.Generate(ctx, params)
 	if err != nil {
 		log.Println(err)
-		UserRequestCount.Store(userID, count)
 		return
 	}
 	answer, err := base64.StdEncoding.DecodeString(response.Data[0].B64JSON)
+	if err != nil {
+		log.Println(err)
+		return
+	}
 
 	// Для ImageModelGPTImage1
 	_, err = b.SendPhoto(ctx, &bot.SendPhotoParams{
@@ -363,7 +504,7 @@ func handleImage(ctx context.Context, b *bot.Bot, update *models.Update, userID 
 		log.Println(err)
 		return
 	}
-	UserRequestCount.Store(userID, count+1)
+	incrementRequestCount(ctx, UserID)
 }
 
 func modelChoicesHandler(ctx context.Context, b *bot.Bot, update *models.Update) {
@@ -371,17 +512,7 @@ func modelChoicesHandler(ctx context.Context, b *bot.Bot, update *models.Update)
 		InlineKeyboard: [][]models.InlineKeyboardButton{
 			{
 				{
-					Text: "gemma3:1b (Самая быстрая)", CallbackData: "model:gemma3n:e2b",
-				},
-			},
-			{
-				{
-					Text: "qwen3:4b (Средняя)", CallbackData: "model:qwen3.5:4b",
-				},
-			},
-			{
-				{
-					Text: "qwen3.5:9b (Самая умная и качественная)", CallbackData: "model:gemma3:4b",
+					Text: "gemma3:1b (Самая быстрая)", CallbackData: "model:gemma3:1b",
 				},
 			},
 			{
@@ -403,10 +534,11 @@ func modelChoicesHandler(ctx context.Context, b *bot.Bot, update *models.Update)
 }
 
 func modelsSelectHandler(ctx context.Context, b *bot.Bot, update *models.Update) {
-	userID := update.CallbackQuery.From.ID
-
+	UserID := update.CallbackQuery.From.ID
 	modelName := strings.TrimPrefix(update.CallbackQuery.Data, "model:")
-	UserSelectedModel.Store(userID, modelName)
+
+	ensureUser(ctx, UserID)
+	setUserModel(ctx, UserID, modelName)
 
 	_, err := b.AnswerCallbackQuery(ctx, &bot.AnswerCallbackQueryParams{
 		CallbackQueryID: update.CallbackQuery.ID,
